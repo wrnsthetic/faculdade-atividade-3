@@ -1,0 +1,5 @@
+# Tabelas e PDF do artigo: o notebook baixa da Springer (fonte original)
+data/modelo/
+
+__pycache__/
+.ipynb_checkpoints/
