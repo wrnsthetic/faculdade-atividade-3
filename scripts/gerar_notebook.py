@@ -40,10 +40,16 @@ Roteiro do notebook:
 2. Setup e imports
 3. Carregar as tabelas do modelo (Tables S2, S5 a S8)
 4. Funções da calculadora
-5. Exemplo com uma amostra real (GEO, EPIC v2)
-6. Exemplo com várias amostras
-7. Testes: amostra sintética e probes ausentes
-8. Interpretação e limitações
+5. **Calcular a idade do seu arquivo (upload)**
+6. Exemplo com uma amostra real (GEO, EPIC v2)
+7. Exemplo com várias amostras
+8. Testes: amostra sintética e probes ausentes
+9. Interpretação e limitações
+
+**Para usar com um arquivo próprio no Colab:** menu *Ambiente de execução >
+Executar tudo*. Quando aparecer o botão **Escolher arquivos** (seção 5),
+selecione o CSV de β-values no computador. Nada mais precisa ser enviado: as
+tabelas do modelo são baixadas sozinhas.
 """)
 
 md(r"""
@@ -137,9 +143,10 @@ execução (no Colab ou localmente) ele baixa o que faltar:
 | Arquivo | Origem |
 |---|---|
 | Tables S2 e S5 a S8 (`.xlsx`) | site da Genome Medicine (Springer), fonte original do artigo |
-| Recorte de 12 amostras do GSE286313 (29 MB) | repositório deste trabalho no GitHub (como foi feito: seção 5) |
+| Recorte de 12 amostras do GSE286313 (29 MB) | repositório deste trabalho no GitHub (como foi feito: seção 6) |
 
-Se os arquivos já existirem em `data/`, nada é baixado.
+Se os arquivos já existirem em `data/`, nada é baixado. O arquivo a ser
+analisado é o único que vem de fora, pelo upload da seção 5.
 """)
 
 code(r"""
@@ -174,6 +181,7 @@ for destino, url in DOWNLOADS.items():
 
 # Parâmetros da calculadora
 LIMIAR_COBERTURA = 0.90  # abaixo disso o relatório emite alerta (não bloqueia)
+LIMIAR_SANGUE = 0.80     # correlação mínima com o perfil de sangue da S2 (alerta, não bloqueia)
 CORTE_JOVEM = 36         # idade_geral <= 36  -> modelo "Jovem"
 CORTE_IDOSO = 59         # idade_geral >= 59  -> modelo "Idoso"; entre os dois -> "Meia-idade"
 
@@ -298,8 +306,11 @@ Cada requisito do enunciado vira uma função curta:
 ### 4.1 Importar os β-values
 
 **Formato de entrada:** uma matriz **probes × amostras** (uma linha por probe,
-uma coluna por amostra), como `DataFrame` ou arquivo CSV/TSV (pode ser `.gz`).
-A primeira coluna do arquivo é o ID do probe.
+uma coluna por amostra), como `DataFrame` ou arquivo CSV/TSV (pode estar
+compactado em `.gz` ou `.zip`). A primeira coluna do arquivo é o ID do probe.
+
+O separador (`,`, `;` ou tab) é detectado sozinho, e também a vírgula decimal
+(`0,85` em vez de `0.85`), comum em arquivos salvos pelo Excel em português.
 
 A função valida o que recebe: valores precisam estar em [0, 1]. Valores fora
 disso indicam que o dado não é β (pode ser intensidade bruta ou M-value) e a
@@ -307,14 +318,23 @@ função para com uma mensagem clara, em vez de calcular uma idade sem sentido.
 """)
 
 code(r"""
+def detectar_formato(caminho):
+    # Lê só as primeiras linhas com cada separador e fica com o que gera mais colunas
+    sep = max([",", ";", "\t"], key=lambda s: pd.read_csv(caminho, sep=s, nrows=5).shape[1])
+    # Vírgula decimal: com ';' ou tab, valores como "0,85" aparecem como texto
+    inicio = pd.read_csv(caminho, sep=sep, nrows=5, index_col=0)
+    tem_virgula = inicio.astype(str).apply(lambda c: c.str.contains(",")).any().any()
+    decimal = "," if sep != "," and tem_virgula else "."
+    return sep, decimal
+
+
 def importar_betas(fonte):
     # Aceita DataFrame (probes x amostras) ou caminho de CSV/TSV com a 1a coluna = ID do probe
     if isinstance(fonte, pd.DataFrame):
         betas = fonte.copy()
     else:
-        caminho = Path(fonte)
-        sep = "\t" if ".tsv" in caminho.suffixes or ".txt" in caminho.suffixes else ","
-        betas = pd.read_csv(caminho, sep=sep, index_col=0)
+        sep, decimal = detectar_formato(fonte)
+        betas = pd.read_csv(fonte, sep=sep, decimal=decimal, index_col=0)
 
     betas.index = betas.index.astype(str)
     betas.columns = betas.columns.astype(str)
@@ -472,7 +492,17 @@ O relatório tem uma linha por amostra. As colunas pedidas no enunciado:
 | `cobertura_geral_%`, `cobertura_especifico_%` | cobertura antes da imputação, por modelo |
 
 Colunas extras: idade do modelo geral, faixa atribuída, quantos valores foram
-imputados e um alerta se alguma cobertura ficar abaixo de 90 %.
+imputados e alertas.
+
+**Alertas** (não bloqueiam o cálculo, só avisam que a idade é pouco confiável):
+
+- `COBERTURA BAIXA`: alguma cobertura abaixo de 90 %;
+- `PERFIL DIFERENTE DE SANGUE`: o relógio só vale para sangue total. Para checar,
+  comparamos os β da amostra, nos CpGs do relógio, com o β médio da população de
+  treino (Table S2, que é sangue) usando a **correlação**. Nas 72 amostras de
+  sangue do GSE286313 ela ficou entre 0,91 e 0,98. Abaixo de 0,80 a amostra
+  provavelmente é de outro tecido, de células cultivadas ou tem algum problema de
+  processamento. Esse limiar é uma escolha desta calculadora, e não do artigo.
 """)
 
 code(r"""
@@ -498,12 +528,23 @@ def calcular_idade_epigenetica(fonte, verbose=True):
         for amostra in grupo.index:
             pres_espec[amostra] = p[amostra]
 
+    # Semelhança com sangue: correlação com o beta médio da população de treino (S2)
+    cpgs_relogio = MODELOS["Geral"]["cpgs"]
+    for m in MODELOS.values():
+        cpgs_relogio = cpgs_relogio.union(m["cpgs"])
+    corr_sangue = betas.reindex(cpgs_relogio).corrwith(MEDIA_BETA.reindex(cpgs_relogio))
+
     linhas = []
     for a in amostras:
         pg, pe = pres_geral[a], pres_espec[a]
         ausentes = sorted(set(pg.index[~pg]) | set(pe.index[~pe]))
         requeridos = pg.index.union(pe.index)
         cob_g, cob_e = pg.mean(), pe.mean()
+        alertas = []
+        if min(cob_g, cob_e) < LIMIAR_COBERTURA:
+            alertas.append("COBERTURA BAIXA")
+        if corr_sangue[a] < LIMIAR_SANGUE:
+            alertas.append("PERFIL DIFERENTE DE SANGUE")
         linhas.append({
             "amostra": a,
             "idade_epigenetica": idade_final[a],
@@ -516,7 +557,8 @@ def calcular_idade_epigenetica(fonte, verbose=True):
             "cobertura_geral_%": 100 * cob_g,
             "cobertura_especifico_%": 100 * cob_e,
             "imputacao_usada": len(ausentes) > 0,
-            "alerta": "COBERTURA BAIXA" if min(cob_g, cob_e) < LIMIAR_COBERTURA else "",
+            "correlacao_sangue": corr_sangue[a],
+            "alerta": "; ".join(alertas),
             "ausentes": ausentes,
         })
     relatorio = pd.DataFrame(linhas).set_index("amostra")
@@ -543,13 +585,71 @@ def imprimir_relatorio(relatorio, amostra, max_ausentes=10):
         print(f"Probes ausentes ({r['n_ausentes']}), imputados com o β médio da S2: {lista}")
     else:
         print("Probes ausentes: nenhum (imputação não foi necessária)")
-    if r["alerta"]:
+    print(f"{'Correlação com sangue de referência:':<38}{r['correlacao_sangue']:.3f}")
+    if "COBERTURA BAIXA" in r["alerta"]:
         print(f"ALERTA: cobertura abaixo de {LIMIAR_COBERTURA:.0%}; idade menos confiável.")
+    if "PERFIL DIFERENTE DE SANGUE" in r["alerta"]:
+        print(f"ALERTA: correlação com sangue abaixo de {LIMIAR_SANGUE}; a amostra não parece "
+              "sangue total e a idade provavelmente não é válida.")
 """)
 
 # ---------------------------------------------------------------------------
 md(r"""
-## 5. Exemplo com uma amostra real (GEO, EPIC v2)
+## 5. Calcular a idade do seu arquivo (upload)
+
+**No Colab:** ao rodar a célula abaixo aparece o botão **Escolher arquivos**.
+Selecione o arquivo com os β-values (CSV, TSV, `.gz` ou `.zip`). A execução
+continua sozinha depois do envio.
+
+Formato esperado: uma linha por probe e uma coluna por amostra, com o ID do probe
+na primeira coluna. Exemplo:
+
+```
+id;amostra1;amostra2
+cg00000029_TC21;0.57;0.61
+cg00000109_TC21;0.89;0.90
+```
+
+**Fora do Colab** (rodando no computador), a célula usa o arquivo indicado em
+`ARQUIVO_LOCAL`, se ele existir.
+
+Arquivos grandes (~150 MB) podem levar alguns minutos para subir no Colab.
+Compactar antes em `.zip` (no Windows: botão direito > *Compactar para arquivo
+ZIP*) deixa o envio mais rápido.
+""")
+
+code(r"""
+ARQUIVO_LOCAL = DIR_AMOSTRAS / "8_metilomas.csv"  # usado só fora do Colab
+
+try:
+    from google.colab import files
+    enviados = files.upload()  # abre a janela para escolher o arquivo no computador
+    arquivo_usuario = Path(next(iter(enviados))) if enviados else None
+except ImportError:
+    arquivo_usuario = ARQUIVO_LOCAL if ARQUIVO_LOCAL.exists() else None
+
+if arquivo_usuario is None:
+    print("Nenhum arquivo enviado: esta seção foi pulada.")
+else:
+    print("Arquivo:", arquivo_usuario.name)
+    rel_usuario = calcular_idade_epigenetica(arquivo_usuario)
+    display(rel_usuario.drop(columns="ausentes").round(2))
+""")
+
+md(r"""
+Relatório de cada amostra do arquivo enviado:
+""")
+
+code(r"""
+if arquivo_usuario is not None:
+    for amostra in rel_usuario.index:
+        imprimir_relatorio(rel_usuario, amostra)
+        print()
+""")
+
+# ---------------------------------------------------------------------------
+md(r"""
+## 6. Exemplo com uma amostra real (GEO, EPIC v2)
 
 ### Escolha do dataset
 
@@ -606,7 +706,7 @@ ausentes), e a cobertura máxima possível em EPIC v2 fica em ~99,9 %.
 
 # ---------------------------------------------------------------------------
 md(r"""
-## 6. Exemplo com várias amostras
+## 7. Exemplo com várias amostras
 
 A mesma função recebe o arquivo inteiro (todas as colunas). Comparamos com a
 idade cronológica do GEO. O artigo reporta erro absoluto médio (MAE) de
@@ -619,7 +719,8 @@ rel = calcular_idade_epigenetica(ARQ_BETAS)
 
 # Relatório mínimo do enunciado (uma linha por amostra) + idade cronológica para comparar
 tabela = rel[["idade_epigenetica", "idade_modelo_geral", "faixa_atribuida", "probes_recebidos",
-              "probes_usados_relogio", "n_ausentes", "cobertura_geral_%", "cobertura_especifico_%", "alerta"]].copy()
+              "probes_usados_relogio", "n_ausentes", "cobertura_geral_%", "cobertura_especifico_%",
+              "correlacao_sangue", "alerta"]].copy()
 tabela.insert(0, "idade_cronologica", meta.loc[tabela.index, "idade"])
 tabela["erro_combinado"] = tabela["idade_epigenetica"] - tabela["idade_cronologica"]
 tabela["erro_geral"] = tabela["idade_modelo_geral"] - tabela["idade_cronologica"]
@@ -670,9 +771,9 @@ plt.show()
 
 # ---------------------------------------------------------------------------
 md(r"""
-## 7. Testes
+## 8. Testes
 
-### 7.1 Amostra sintética
+### 8.1 Amostra sintética
 
 Criamos uma amostra artificial: os β médios da S2 com um pequeno ruído, só nos
 CpGs do modelo e **sem** sufixo (formato 450K/EPIC v1). Esperado: idade plausível,
@@ -696,7 +797,7 @@ rel_sint.drop(columns="ausentes").round(2)
 """)
 
 md(r"""
-### 7.2 Probes ausentes
+### 8.2 Probes ausentes
 
 Pegamos uma amostra real e removemos aleatoriamente 5 %, 20 % e 50 % dos CpGs
 do modelo geral (apagando as linhas, com e sem sufixo). Esperado:
@@ -743,7 +844,7 @@ imprimir_relatorio(calcular_idade_epigenetica(teste, verbose=False), AMOSTRA_TES
 
 # ---------------------------------------------------------------------------
 md(r"""
-## 8. Interpretação e limitações
+## 9. Interpretação e limitações
 
 ### Como ler o resultado
 
@@ -765,7 +866,9 @@ md(r"""
   artigo, o modelo detecta aumento da EAA com radioterapia e câncer de mama, mas
   menor que a variação normal da população, e nenhuma mudança com exercício.
 - **Só sangue total:** os coeficientes não valem para outros tecidos (saliva,
-  biópsias, células isoladas) sem recalibração.
+  biópsias, células isoladas) sem recalibração. A calculadora avisa quando a
+  amostra não parece sangue (alerta da seção 4.6), mas ainda assim calcula um
+  número, que nesse caso não deve ser interpretado como idade.
 - **Faixa etária dos dados de treino:** amostras fora da faixa bem representada
   (crianças pequenas, idades muito altas) tendem a ter mais erro, e o modelo
   combinado depende da faixa atribuída pelo modelo geral: uma amostra perto dos

@@ -3,3 +3,6 @@ data/modelo/
 
 __pycache__/
 .ipynb_checkpoints/
+
+# Arquivo de teste do professor (150 MB, acima do limite do GitHub): vai por upload
+data/amostras/8_metilomas.csv
